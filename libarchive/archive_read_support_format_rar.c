@@ -2376,10 +2376,11 @@ parse_codes(struct archive_read *a)
   struct rar *rar = a->format->data;
   int i, j, val, n, r;
   unsigned char bitlengths[MAX_SYMBOLS], zerocount, ppmd_flags;
-  unsigned int maxorder;
+  unsigned int maxorder, ppmd_dictionary_size;
   struct huffman_code precode;
   struct rar_br *br = &(rar->br);
 
+  ppmd_dictionary_size = 0;
   free_codes(a);
 
   /* Skip to the next byte */
@@ -2401,7 +2402,7 @@ parse_codes(struct archive_read *a)
     {
       if (!rar_br_read_ahead(a, br, 8))
         goto truncated_data;
-      rar->dictionary_size = (rar_br_bits(br, 8) + 1) << 20;
+      ppmd_dictionary_size = (rar_br_bits(br, 8) + 1) << 20;
       rar_br_consume(br, 8);
     }
 
@@ -2438,14 +2439,14 @@ parse_codes(struct archive_read *a)
       rar->range_dec.Stream = &rar->bytein;
       __archive_ppmd7_functions.Ppmd7_Construct(&rar->ppmd7_context);
 
-      if (rar->dictionary_size == 0) {
+      if (ppmd_dictionary_size == 0) {
         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
                           "Invalid zero dictionary size");
         return (ARCHIVE_FAILED);
       }
 
       if (!__archive_ppmd7_functions.Ppmd7_Alloc(&rar->ppmd7_context,
-        rar->dictionary_size))
+        ppmd_dictionary_size))
       {
         archive_set_error(&a->archive, ENOMEM,
                           "Out of memory");
@@ -2617,7 +2618,7 @@ parse_codes(struct archive_read *a)
       return (r);
   }
 
-  if (!rar->is_ppmd_block) {
+  {
     unsigned int file_dictionary_size;
 
     file_dictionary_size = rar_lzss_dictionary_size(rar->file_flags);
