@@ -185,7 +185,12 @@ static int extract_libarchive(const fs::path &archive_path,
   archive_read_support_format_rar(a);
   archive_read_support_format_rar5(a);
 
-  int r = archive_read_open_filename(a, archive_path.string().c_str(), 10240);
+  int r;
+#ifdef _WIN32
+  r = archive_read_open_filename_w(a, archive_path.c_str(), 10240);
+#else
+  r = archive_read_open_filename(a, archive_path.string().c_str(), 10240);
+#endif
   if (r != ARCHIVE_OK) {
     std::cerr << "libarchive open failed: " << archive_error_string(a) << "\n";
     archive_read_free(a);
