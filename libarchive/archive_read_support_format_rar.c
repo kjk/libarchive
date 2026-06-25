@@ -976,11 +976,8 @@ archive_read_format_rar_read_header(struct archive_read *a,
   {
     unsigned long crc32_val;
 
-    if ((h = __archive_read_ahead(a, 7, NULL)) == NULL) {
-      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-                        "Failed to read next header");
-      return (ARCHIVE_FATAL);
-    }
+    if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
+      return (ARCHIVE_EOF);
     p = h;
 
     head_type = p[2];
@@ -2165,6 +2162,12 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
         return (ARCHIVE_FAILED);
 #endif
       }
+      if ((unsigned char)rar->unp_version < 29 &&
+          (rar->file_flags & FHD_SOLID) == 0) {
+        ret = archive_read_format_rar_read_data_skip(a);
+        if (ret < ARCHIVE_WARN)
+          return (ret);
+      }
       rar->entry_eof = 1;
       return (ARCHIVE_EOF);
     }
@@ -2327,7 +2330,9 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
       }
 
       if ((unsigned char)rar->unp_version < 29) {
-        end = rar->entry_start_offset + rar->unp_size;
+        int64_t entry_end = rar->entry_start_offset + rar->unp_size;
+        if (end > entry_end)
+          end = entry_end;
         ret = expand20(a, &end);
       } else
         ret = expand(a, &end);
@@ -2759,9 +2764,11 @@ make_decode_table20(unsigned char *lengths, struct huffman_decode_table *table,
     table->quick_len[code] = (unsigned char)cur_bit_length;
     dist = bit_field - table->decode_len[cur_bit_length - 1];
     dist >>= 16 - cur_bit_length;
-    pos = table->decode_pos[cur_bit_length] + dist;
-    table->quick_num[code] = (unsigned short)(pos < size ?
-        table->decode_num[pos] : 0);
+    if (cur_bit_length < 16 &&
+        (pos = table->decode_pos[cur_bit_length] + dist) < size)
+      table->quick_num[code] = table->decode_num[pos];
+    else
+      table->quick_num[code] = 0;
   }
 }
 

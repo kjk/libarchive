@@ -365,8 +365,20 @@ static int test_rar_main(int argc,
 
   try {
     int ur = run_unrar(unrar, archive_path, unrar_dir, verbose);
+    bool have_unrar_files = true;
     if (ur != 0) {
-      std::cerr << "unrar failed with exit status " << ur << "\n";
+      auto unrar_files = list_files(unrar_dir);
+      if (unrar_files.empty()) {
+        std::cerr << "unrar failed with exit status " << ur << "\n";
+        status = 1;
+        have_unrar_files = false;
+      } else {
+        std::cerr << "unrar exited with status " << ur
+                  << " after extracting " << unrar_files.size()
+                  << " files; comparing extracted content\n";
+      }
+    }
+    if (!have_unrar_files) {
       status = 1;
     } else if (extract_libarchive(archive_path, libarchive_dir) != 0) {
       status = 1;
