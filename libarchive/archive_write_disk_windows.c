@@ -2205,7 +2205,10 @@ guidword(wchar_t *p, int n)
 
 /*
  * Canonicalize the pathname.  In particular, this strips duplicate
- * '\' characters, '.' elements, and trailing '\'.  It also raises an
+ * '\' characters, '.' elements, and trailing '\'.  It also replaces
+ * trailing '.' and ' ' characters in path elements with '_', since
+ * Win32 otherwise aliases those names to entries without the trailing
+ * characters.  It also raises an
  * error for an empty path, a trailing '..' or (if _SECURE_NODOTDOT is
  * set) any '..' in the path or (if ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS)
  * if the path is absolute.
@@ -2366,9 +2369,12 @@ cleanup_pathname(struct archive_write_disk *a, wchar_t *name)
 		/* Copy current element, including leading '\'. */
 		if (separator)
 			*dest++ = L'\\';
+		p = dest;
 		while (*src != L'\0' && *src != L'\\') {
 			*dest++ = *src++;
 		}
+		while (dest > p && (dest[-1] == L'.' || dest[-1] == L' '))
+			dest[-1] = L'_';
 
 		if (*src == L'\0')
 			break;
