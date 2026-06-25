@@ -132,8 +132,18 @@
 #define HUFFMAN_TABLE_SIZE \
   MAINCODE_SIZE + OFFSETCODE_SIZE + LOWOFFSETCODE_SIZE + LENGTHCODE_SIZE
 
+#define MAINCODE_SIZE20      298
+#define OFFSETCODE_SIZE20    48
+#define LENGTHCODE_SIZE20    28
+#define BITCODE_SIZE20       19
+#define AUDIOCODE_SIZE20     257
+#define HUFFMAN_TABLE_SIZE20 \
+  MAINCODE_SIZE20 + OFFSETCODE_SIZE20 + LENGTHCODE_SIZE20
+
 #define MAX_SYMBOL_LENGTH 0xF
 #define MAX_SYMBOLS       20
+#define QUICK_DECODE_BITS 9
+#define LARGEST_TABLE_SIZE MAINCODE_SIZE
 
 /* Virtual Machine Properties */
 #define VM_MEMORY_SIZE 0x40000
@@ -207,6 +217,17 @@ struct huffman_code
   int maxlength;
   int tablesize;
   struct huffman_table_entry *table;
+};
+
+struct huffman_decode_table
+{
+  unsigned int maxnum;
+  unsigned int decode_len[16];
+  unsigned int decode_pos[16];
+  unsigned int quick_bits;
+  unsigned char quick_len[1 << QUICK_DECODE_BITS];
+  unsigned short quick_num[1 << QUICK_DECODE_BITS];
+  unsigned short decode_num[LARGEST_TABLE_SIZE];
 };
 
 struct lzss
@@ -296,6 +317,7 @@ struct rar
   char encryptver;
 
   /* File header entries */
+  char unp_version;
   char compression_method;
   unsigned file_flags;
   int64_t packed_size;
@@ -349,9 +371,15 @@ struct rar
   unsigned int lastlength;
   unsigned int lastoffset;
   unsigned int oldoffset[4];
+  unsigned int oldoffset_ptr;
   unsigned int lastlowoffset;
   unsigned int numlowoffsetrepeats;
   char start_new_table;
+  char tables_read20;
+  unsigned char oldtable20[AUDIOCODE_SIZE20 * 4];
+  struct huffman_decode_table maincode20;
+  struct huffman_decode_table offsetcode20;
+  struct huffman_decode_table lengthcode20;
 
   /* Filters */
   struct rar_filters filters;
@@ -419,8 +447,13 @@ static int read_data_stored(struct archive_read *, const void **, size_t *,
 static int read_data_compressed(struct archive_read *, const void **, size_t *,
                                 int64_t *, size_t);
 static int rar_br_preparation(struct archive_read *, struct rar_br *);
+static int parse_codes20(struct archive_read *);
 static int parse_codes(struct archive_read *);
 static void free_codes(struct archive_read *);
+static void make_decode_table20(unsigned char *, struct huffman_decode_table *,
+                                unsigned int);
+static int read_next_symbol20(struct archive_read *,
+                              struct huffman_decode_table *);
 static int read_next_symbol(struct archive_read *, struct huffman_code *);
 static int create_code(struct archive_read *, struct huffman_code *,
                        unsigned char *, int, char);
@@ -430,6 +463,7 @@ static int new_node(struct huffman_code *);
 static int make_table(struct archive_read *, struct huffman_code *);
 static int make_table_recurse(struct archive_read *, struct huffman_code *, int,
                               struct huffman_table_entry *, int, int);
+static int expand20(struct archive_read *, int64_t *);
 static int expand(struct archive_read *, int64_t *);
 static int copy_from_lzss_window_to_unp(struct archive_read *, const void **,
                                         int64_t, size_t);
@@ -1459,6 +1493,7 @@ read_header(struct archive_read *a, struct archive_entry *entry,
   memcpy(&file_header, p, sizeof(file_header));
   p += sizeof(file_header);
 
+  rar->unp_version = file_header.unp_ver;
   rar->compression_method = file_header.method;
 
   ttime = archive_le32dec(file_header.file_time);
@@ -1816,11 +1851,18 @@ read_header(struct archive_read *a, struct archive_entry *entry,
   rar->valid = 1;
   rar->is_ppmd_block = 0;
   rar->start_new_table = 1;
+  rar->tables_read20 = 0;
+  rar->lastoffset = (unsigned int)-1;
+  rar->lastlength = 0;
+  rar->oldoffset[0] = rar->oldoffset[1] = rar->oldoffset[2] =
+      rar->oldoffset[3] = (unsigned int)-1;
+  rar->oldoffset_ptr = 0;
   free(rar->unp_buffer);
   rar->unp_buffer = NULL;
   rar->unp_offset = 0;
   rar->unp_buffer_size = UNP_BUFFER_SIZE;
   memset(rar->lengthtable, 0, sizeof(rar->lengthtable));
+  memset(rar->oldtable20, 0, sizeof(rar->oldtable20));
   __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
   rar->ppmd_valid = rar->ppmd_eod = 0;
   rar->filters.filterstart = INT64_MAX;
@@ -2154,8 +2196,14 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
     if (!rar->br.next_in &&
       (ret = rar_br_preparation(a, &(rar->br))) < ARCHIVE_WARN)
       return (ret);
-    if (rar->start_new_table && ((ret = parse_codes(a)) < (ARCHIVE_WARN)))
-      return (ret);
+    if (rar->start_new_table) {
+      if ((unsigned char)rar->unp_version < 29)
+        ret = parse_codes20(a);
+      else
+        ret = parse_codes(a);
+      if (ret < ARCHIVE_WARN)
+        return (ret);
+    }
 
     if (rar->is_ppmd_block)
     {
@@ -2259,7 +2307,11 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
         end = rar->filters.filterstart;
       }
 
-      ret = expand(a, &end);
+      if ((unsigned char)rar->unp_version < 29) {
+        end = rar->unp_size;
+        ret = expand20(a, &end);
+      } else
+        ret = expand(a, &end);
       if (ret != ARCHIVE_OK)
         return (ret);
 
@@ -2604,6 +2656,230 @@ free_codes(struct archive_read *a)
   memset(&rar->lengthcode, 0, sizeof(rar->lengthcode));
 }
 
+static void
+make_decode_table20(unsigned char *lengths, struct huffman_decode_table *table,
+                    unsigned int size)
+{
+  unsigned int length_count[16];
+  unsigned int copy_decode_pos[16];
+  unsigned int upper_limit, i, code, quick_data_size, cur_bit_length;
+
+  memset(table, 0, sizeof(*table));
+  table->maxnum = size;
+
+  memset(length_count, 0, sizeof(length_count));
+  for (i = 0; i < size; i++)
+    length_count[lengths[i] & 0x0f]++;
+  length_count[0] = 0;
+
+  table->decode_pos[0] = 0;
+  table->decode_len[0] = 0;
+  upper_limit = 0;
+  for (i = 1; i < 16; i++) {
+    upper_limit += length_count[i];
+    table->decode_len[i] = upper_limit << (16 - i);
+    upper_limit *= 2;
+    table->decode_pos[i] = table->decode_pos[i - 1] + length_count[i - 1];
+  }
+
+  memcpy(copy_decode_pos, table->decode_pos, sizeof(copy_decode_pos));
+  for (i = 0; i < size; i++) {
+    unsigned char length = lengths[i] & 0x0f;
+    if (length != 0) {
+      unsigned int pos = copy_decode_pos[length];
+      if (pos < LARGEST_TABLE_SIZE)
+        table->decode_num[pos] = (unsigned short)i;
+      copy_decode_pos[length]++;
+    }
+  }
+
+  table->quick_bits = (size == MAINCODE_SIZE20) ? QUICK_DECODE_BITS :
+      (QUICK_DECODE_BITS > 3 ? QUICK_DECODE_BITS - 3 : 0);
+  quick_data_size = 1U << table->quick_bits;
+  cur_bit_length = 1;
+  for (code = 0; code < quick_data_size; code++) {
+    unsigned int bit_field = code << (16 - table->quick_bits);
+    unsigned int dist, pos;
+
+    while (cur_bit_length < 16 &&
+        bit_field >= table->decode_len[cur_bit_length])
+      cur_bit_length++;
+
+    table->quick_len[code] = (unsigned char)cur_bit_length;
+    dist = bit_field - table->decode_len[cur_bit_length - 1];
+    dist >>= 16 - cur_bit_length;
+    pos = table->decode_pos[cur_bit_length] + dist;
+    table->quick_num[code] = (unsigned short)(pos < size ?
+        table->decode_num[pos] : 0);
+  }
+}
+
+static int
+read_next_symbol20(struct archive_read *a, struct huffman_decode_table *table)
+{
+  struct rar *rar = (struct rar *)(a->format->data);
+  struct rar_br *br = &(rar->br);
+  unsigned int bit_field, bits, dist, pos, code;
+
+  if (rar_br_read_ahead(a, br, 16))
+    bit_field = rar_br_bits(br, 16) & 0xfffe;
+  else if (rar->bytes_remaining == 0 && br->cache_avail > 0)
+    bit_field = rar_br_bits_forced(br, 16) & 0xfffe;
+  else if (rar->bytes_remaining == 0)
+    bit_field = 0;
+  else {
+    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                      "Truncated RAR file data");
+    rar->valid = 0;
+    return (-1);
+  }
+  if (bit_field < table->decode_len[table->quick_bits]) {
+    code = bit_field >> (16 - table->quick_bits);
+    if (table->quick_len[code] > br->cache_avail)
+      br->cache_avail = 0;
+    else
+      rar_br_consume(br, table->quick_len[code]);
+    return table->quick_num[code];
+  }
+
+  bits = 15;
+  for (unsigned int i = table->quick_bits + 1; i < 15; i++) {
+    if (bit_field < table->decode_len[i]) {
+      bits = i;
+      break;
+    }
+  }
+  if ((int)bits > br->cache_avail)
+    br->cache_avail = 0;
+  else
+    rar_br_consume(br, bits);
+
+  dist = bit_field - table->decode_len[bits - 1];
+  dist >>= 16 - bits;
+  pos = table->decode_pos[bits] + dist;
+  if (pos >= table->maxnum)
+    pos = 0;
+  return table->decode_num[pos];
+}
+
+static int
+parse_codes20(struct archive_read *a)
+{
+  struct rar *rar = (struct rar *)(a->format->data);
+  struct rar_br *br = &(rar->br);
+  unsigned char bitlengths[BITCODE_SIZE20];
+  unsigned char table[AUDIOCODE_SIZE20 * 4];
+  unsigned int bitfield, tablesize, i;
+
+  if (!rar_br_read_ahead(a, br, 16))
+    goto truncated_data;
+  bitfield = rar_br_bits(br, 16);
+  if (bitfield & 0x8000) {
+    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                      "RAR v2 audio compression is unsupported");
+    return (ARCHIVE_FAILED);
+  }
+  if (!(bitfield & 0x4000))
+    memset(rar->oldtable20, 0, sizeof(rar->oldtable20));
+  rar_br_consume(br, 2);
+
+  tablesize = HUFFMAN_TABLE_SIZE20;
+  for (i = 0; i < BITCODE_SIZE20; i++) {
+    if (!rar_br_read_ahead(a, br, 4))
+      goto truncated_data;
+    bitlengths[i] = (unsigned char)rar_br_bits(br, 4);
+    rar_br_consume(br, 4);
+  }
+
+  make_decode_table20(bitlengths, &rar->lengthcode20, BITCODE_SIZE20);
+  memset(table, 0, sizeof(table));
+  for (i = 0; i < tablesize;) {
+    int number;
+    unsigned int n;
+
+    number = read_next_symbol20(a, &rar->lengthcode20);
+    if (number < 0)
+      return (ARCHIVE_FAILED);
+
+    if (number < 16) {
+      table[i] = (unsigned char)((number + rar->oldtable20[i]) & 0x0f);
+      i++;
+    } else if (number == 16) {
+      if (!rar_br_read_ahead(a, br, 2))
+        goto truncated_data;
+      n = rar_br_bits(br, 2) + 3;
+      rar_br_consume(br, 2);
+      if (i == 0) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                          "Bad RAR file data");
+        return (ARCHIVE_FAILED);
+      }
+      while (n-- > 0 && i < tablesize) {
+        table[i] = table[i - 1];
+        i++;
+      }
+    } else {
+      if (number == 17) {
+        if (!rar_br_read_ahead(a, br, 3))
+          goto truncated_data;
+        n = rar_br_bits(br, 3) + 3;
+        rar_br_consume(br, 3);
+      } else {
+        if (!rar_br_read_ahead(a, br, 7))
+          goto truncated_data;
+        n = rar_br_bits(br, 7) + 11;
+        rar_br_consume(br, 7);
+      }
+      while (n-- > 0 && i < tablesize)
+        table[i++] = 0;
+    }
+  }
+
+  make_decode_table20(&table[0], &rar->maincode20, MAINCODE_SIZE20);
+  make_decode_table20(&table[MAINCODE_SIZE20], &rar->offsetcode20,
+                      OFFSETCODE_SIZE20);
+  make_decode_table20(&table[MAINCODE_SIZE20 + OFFSETCODE_SIZE20],
+                      &rar->lengthcode20, LENGTHCODE_SIZE20);
+  memcpy(rar->oldtable20, table, tablesize);
+  rar->tables_read20 = 1;
+
+  if (!rar->dictionary_size || !rar->lzss.window ||
+      (unsigned int)(rar->lzss.mask + 1) < rar->dictionary_size)
+  {
+    void *new_window;
+    unsigned int new_size;
+
+    if (rar->unp_size >= DICTIONARY_MAX_SIZE)
+      new_size = DICTIONARY_MAX_SIZE;
+    else
+      new_size = rar_fls((unsigned int)rar->unp_size) << 1;
+    if (new_size == 0) {
+      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                        "Zero window size is invalid");
+      return (ARCHIVE_FAILED);
+    }
+    new_window = realloc(rar->lzss.window, new_size);
+    if (new_window == NULL) {
+      archive_set_error(&a->archive, ENOMEM,
+                        "Unable to allocate memory for uncompressed data");
+      return (ARCHIVE_FATAL);
+    }
+    rar->lzss.window = (unsigned char *)new_window;
+    rar->dictionary_size = new_size;
+    memset(rar->lzss.window, 0, rar->dictionary_size);
+    rar->lzss.mask = rar->dictionary_size - 1;
+  }
+
+  rar->start_new_table = 0;
+  return (ARCHIVE_OK);
+
+truncated_data:
+  archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                    "Truncated RAR file data");
+  rar->valid = 0;
+  return (ARCHIVE_FAILED);
+}
+
 
 static int
 read_next_symbol(struct archive_read *a, struct huffman_code *code)
@@ -2913,6 +3189,162 @@ make_table_recurse(struct archive_read *a, struct huffman_code *code, int node,
     }
   }
   return ret;
+}
+
+static int
+expand20(struct archive_read *a, int64_t *end)
+{
+  static const unsigned char lengthbases[] =
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20,
+      24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160,
+      192, 224 };
+  static const unsigned char lengthbits[] =
+    { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2,
+      2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5 };
+  static const unsigned int offsetbases[] =
+    { 0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96,
+      128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
+      4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152,
+      65536, 98304, 131072, 196608, 262144, 327680, 393216,
+      458752, 524288, 589824, 655360, 720896, 786432, 851968,
+      917504, 983040 };
+  static const unsigned char offsetbits[] =
+    { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+      7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+      14, 14, 15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+      16, 16, 16, 16, 16 };
+  static const unsigned char shortbases[] =
+    { 0, 4, 8, 16, 32, 64, 128, 192 };
+  static const unsigned char shortbits[] =
+    { 2, 2, 3, 4, 5, 6, 6, 6 };
+  struct rar *rar = (struct rar *)(a->format->data);
+  struct rar_br *br = &(rar->br);
+  int symbol;
+
+  while (1) {
+    unsigned int length, distance, bits, number;
+
+    if (lzss_position(&rar->lzss) >= *end)
+      return (ARCHIVE_OK);
+
+    symbol = read_next_symbol20(a, &rar->maincode20);
+    if (symbol < 0)
+      goto bad_data;
+
+    if (symbol < 256) {
+      lzss_emit_literal(rar, (uint8_t)symbol);
+      continue;
+    }
+
+    if (symbol > 269) {
+      number = (unsigned int)symbol - 270;
+      if (number >= sizeof(lengthbases)) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                          "Bad RAR v20 length symbol %u", number);
+        goto bad_data;
+      }
+      length = lengthbases[number] + 3;
+      bits = lengthbits[number];
+      if (bits > 0) {
+        if (!rar_br_read_ahead(a, br, bits))
+          goto truncated_data;
+        length += rar_br_bits(br, bits);
+        rar_br_consume(br, bits);
+      }
+
+      symbol = read_next_symbol20(a, &rar->offsetcode20);
+      if (symbol < 0 || (size_t)symbol >= sizeof(offsetbases) /
+          sizeof(offsetbases[0])) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                          "Bad RAR v20 offset symbol %d", symbol);
+        goto bad_data;
+      }
+      distance = offsetbases[symbol] + 1;
+      bits = offsetbits[symbol];
+      if (bits > 0) {
+        if (!rar_br_read_ahead(a, br, bits))
+          goto truncated_data;
+        distance += rar_br_bits(br, bits);
+        rar_br_consume(br, bits);
+      }
+
+      if (distance >= 0x2000) {
+        length++;
+        if (distance >= 0x40000)
+          length++;
+      }
+    } else if (symbol == 269) {
+      if (parse_codes20(a) != ARCHIVE_OK)
+        goto bad_data;
+      continue;
+    } else if (symbol == 256) {
+      if (rar->lastlength == 0)
+        continue;
+      length = rar->lastlength;
+      distance = rar->lastoffset;
+    } else if (symbol < 261) {
+      unsigned int offsindex = ((rar->oldoffset_ptr -
+          ((unsigned int)symbol - 256)) & 3);
+      distance = rar->oldoffset[offsindex];
+      symbol = read_next_symbol20(a, &rar->lengthcode20);
+      if (symbol < 0 || (size_t)symbol >= sizeof(lengthbases)) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                          "Bad RAR v20 repeat length symbol %d", symbol);
+        goto bad_data;
+      }
+      length = lengthbases[symbol] + 2;
+      bits = lengthbits[symbol];
+      if (bits > 0) {
+        if (!rar_br_read_ahead(a, br, bits))
+          goto truncated_data;
+        length += rar_br_bits(br, bits);
+        rar_br_consume(br, bits);
+      }
+      if (distance >= 0x101) {
+        length++;
+        if (distance >= 0x2000) {
+          length++;
+          if (distance >= 0x40000)
+            length++;
+        }
+      }
+    } else {
+      number = (unsigned int)symbol - 261;
+      if (number >= sizeof(shortbases)) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                          "Bad RAR v20 short distance symbol %u", number);
+        goto bad_data;
+      }
+      distance = shortbases[number] + 1;
+      bits = shortbits[number];
+      if (bits > 0) {
+        if (!rar_br_read_ahead(a, br, bits))
+          goto truncated_data;
+        distance += rar_br_bits(br, bits);
+        rar_br_consume(br, bits);
+      }
+      length = 2;
+    }
+
+    rar->lastoffset = distance;
+    rar->oldoffset[rar->oldoffset_ptr++] = distance;
+    rar->oldoffset_ptr &= 3;
+    rar->lastlength = length;
+    lzss_emit_match(rar, (int)distance, (int)length);
+  }
+
+truncated_data:
+  archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                    "Truncated RAR v20 file data at offset %jd of %jd",
+                    (intmax_t)lzss_position(&rar->lzss),
+                    (intmax_t)*end);
+  rar->valid = 0;
+  return (ARCHIVE_FAILED);
+bad_data:
+  if (archive_error_string(&a->archive) == NULL)
+    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                      "Bad RAR file data");
+  return (ARCHIVE_FAILED);
 }
 
 static int
