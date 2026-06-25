@@ -123,8 +123,6 @@
 
 #define NS_UNIT 10000000
 
-#define DICTIONARY_MAX_SIZE 0x400000
-
 #define MAINCODE_SIZE      299
 #define OFFSETCODE_SIZE    60
 #define LOWOFFSETCODE_SIZE 17
@@ -343,6 +341,7 @@ struct rar
   int64_t bytes_unconsumed;
   int64_t bytes_remaining;
   int64_t bytes_uncopied;
+  int64_t entry_start_offset;
   int64_t offset;
   int64_t offset_outgoing;
   int64_t offset_seek;
@@ -472,6 +471,7 @@ static int parse_filter(struct archive_read *, const uint8_t *, uint16_t,
                         uint8_t);
 static int run_filters(struct archive_read *);
 static void clear_filters(struct rar_filters *);
+static void reset_file_filters(struct rar_filters *, int);
 static struct rar_filter *create_filter(struct rar_program_code *,
                                         const uint8_t *, uint32_t,
                                         uint32_t[8], size_t, uint32_t);
@@ -642,18 +642,6 @@ rar_br_preparation(struct archive_read *a, struct rar_br *br)
       (void)rar_br_fillup(a, br);
   }
   return (ARCHIVE_OK);
-}
-
-/* Find last bit set */
-static inline int
-rar_fls(unsigned int word)
-{
-  word |= (word >>  1);
-  word |= (word >>  2);
-  word |= (word >>  4);
-  word |= (word >>  8);
-  word |= (word >> 16);
-  return word - (word >> 1);
 }
 
 /* LZSS functions */
@@ -1443,32 +1431,23 @@ read_header(struct archive_read *a, struct archive_entry *entry,
   crc32_computed = crc32(0, (const unsigned char *)p + 2, 7 - 2);
   __archive_read_consume(a, 7);
 
-  if (!(rar->file_flags & FHD_SOLID))
-  {
-    rar->compression_method = 0;
-    rar->packed_size = 0;
-    rar->unp_size = 0;
-    rar->mtime = 0;
-    rar->ctime = 0;
-    rar->atime = 0;
-    rar->arctime = 0;
-    rar->mode = 0;
-    memset(&rar->salt, 0, sizeof(rar->salt));
-    rar->atime = 0;
-    rar->ansec = 0;
-    rar->ctime = 0;
-    rar->cnsec = 0;
-    rar->mtime = 0;
-    rar->mnsec = 0;
-    rar->arctime = 0;
-    rar->arcnsec = 0;
-  }
-  else
-  {
-    archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-                      "RAR solid archive support unavailable");
-    return (ARCHIVE_FATAL);
-  }
+  rar->compression_method = 0;
+  rar->packed_size = 0;
+  rar->unp_size = 0;
+  rar->mtime = 0;
+  rar->ctime = 0;
+  rar->atime = 0;
+  rar->arctime = 0;
+  rar->mode = 0;
+  memset(&rar->salt, 0, sizeof(rar->salt));
+  rar->atime = 0;
+  rar->ansec = 0;
+  rar->ctime = 0;
+  rar->cnsec = 0;
+  rar->mtime = 0;
+  rar->mnsec = 0;
+  rar->arctime = 0;
+  rar->arcnsec = 0;
 
   if ((h = __archive_read_ahead(a, (size_t)header_size - 7, NULL)) == NULL)
   {
@@ -1839,9 +1818,31 @@ read_header(struct archive_read *a, struct archive_entry *entry,
   }
 
   rar->bytes_uncopied = rar->bytes_unconsumed = 0;
-  rar->lzss.position = rar->offset = 0;
+  if (rar->file_flags & FHD_SOLID) {
+    if (rar->lzss.window == NULL) {
+      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                        "Solid RAR entry without initialized dictionary");
+      return (ARCHIVE_FATAL);
+    }
+    rar->offset = rar->lzss.position;
+  } else {
+    rar->lzss.position = rar->offset = 0;
+    rar->dictionary_size = 0;
+    rar->is_ppmd_block = 0;
+    rar->start_new_table = 1;
+    rar->tables_read20 = 0;
+    rar->lastoffset = (unsigned int)-1;
+    rar->lastlength = 0;
+    rar->oldoffset[0] = rar->oldoffset[1] = rar->oldoffset[2] =
+        rar->oldoffset[3] = (unsigned int)-1;
+    rar->oldoffset_ptr = 0;
+    memset(rar->lengthtable, 0, sizeof(rar->lengthtable));
+    memset(rar->oldtable20, 0, sizeof(rar->oldtable20));
+    __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
+    rar->ppmd_valid = rar->ppmd_eod = 0;
+  }
   rar->offset_seek = 0;
-  rar->dictionary_size = 0;
+  rar->entry_start_offset = rar->offset;
   rar->offset_outgoing = 0;
   rar->br.cache_avail = 0;
   rar->br.avail_in = 0;
@@ -1849,22 +1850,11 @@ read_header(struct archive_read *a, struct archive_entry *entry,
   rar->crc_calculated = 0;
   rar->entry_eof = 0;
   rar->valid = 1;
-  rar->is_ppmd_block = 0;
-  rar->start_new_table = 1;
-  rar->tables_read20 = 0;
-  rar->lastoffset = (unsigned int)-1;
-  rar->lastlength = 0;
-  rar->oldoffset[0] = rar->oldoffset[1] = rar->oldoffset[2] =
-      rar->oldoffset[3] = (unsigned int)-1;
-  rar->oldoffset_ptr = 0;
   free(rar->unp_buffer);
   rar->unp_buffer = NULL;
   rar->unp_offset = 0;
   rar->unp_buffer_size = UNP_BUFFER_SIZE;
-  memset(rar->lengthtable, 0, sizeof(rar->lengthtable));
-  memset(rar->oldtable20, 0, sizeof(rar->oldtable20));
-  __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
-  rar->ppmd_valid = rar->ppmd_eod = 0;
+  reset_file_filters(&rar->filters, rar->file_flags & FHD_SOLID);
   rar->filters.filterstart = INT64_MAX;
 
   archive_entry_set_mtime(entry, rar->mtime, rar->mnsec);
@@ -2132,7 +2122,8 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
     }
 
     if (rar->ppmd_eod ||
-       (rar->dictionary_size && rar->offset >= rar->unp_size))
+       (rar->dictionary_size &&
+        rar->offset - rar->entry_start_offset >= rar->unp_size))
     {
       if (rar->unp_offset > 0) {
         /*
@@ -2308,7 +2299,7 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
       }
 
       if ((unsigned char)rar->unp_version < 29) {
-        end = rar->unp_size;
+        end = rar->entry_start_offset + rar->unp_size;
         ret = expand20(a, &end);
       } else
         ret = expand(a, &end);
@@ -2350,6 +2341,29 @@ ending_block:
   /* Calculate File CRC. */
   rar->crc_calculated = crc32(rar->crc_calculated, *buff, (unsigned)*size);
   return ret;
+}
+
+static unsigned int
+rar_lzss_dictionary_size(unsigned int file_flags)
+{
+  switch (file_flags & DICTIONARY_MASK) {
+  case DICTIONARY_SIZE_64:
+    return 64 * 1024;
+  case DICTIONARY_SIZE_128:
+    return 128 * 1024;
+  case DICTIONARY_SIZE_256:
+    return 256 * 1024;
+  case DICTIONARY_SIZE_512:
+    return 512 * 1024;
+  case DICTIONARY_SIZE_1024:
+    return 1024 * 1024;
+  case DICTIONARY_SIZE_2048:
+    return 2048 * 1024;
+  case DICTIONARY_SIZE_4096:
+    return 4096 * 1024;
+  default:
+    return 0;
+  }
 }
 
 static int
@@ -2599,32 +2613,26 @@ parse_codes(struct archive_read *a)
       return (r);
   }
 
+  if (!rar->is_ppmd_block) {
+    unsigned int file_dictionary_size;
+
+    file_dictionary_size = rar_lzss_dictionary_size(rar->file_flags);
+    if (file_dictionary_size > rar->dictionary_size)
+      rar->dictionary_size = file_dictionary_size;
+  }
+
   if (!rar->dictionary_size || !rar->lzss.window ||
       (unsigned int)(rar->lzss.mask + 1) < rar->dictionary_size)
   {
-    /* Seems as though dictionary sizes are not used. Even so, minimize
-     * memory usage as much as possible.
-     */
     void *new_window;
-    unsigned int new_size;
 
-    if (rar->unp_size >= DICTIONARY_MAX_SIZE)
-      new_size = DICTIONARY_MAX_SIZE;
-    else
-      new_size = rar_fls((unsigned int)rar->unp_size) << 1;
-    if (new_size == 0) {
-      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-                        "Zero window size is invalid");
-      return (ARCHIVE_FAILED);
-    }
-    new_window = realloc(rar->lzss.window, new_size);
+    new_window = realloc(rar->lzss.window, rar->dictionary_size);
     if (new_window == NULL) {
       archive_set_error(&a->archive, ENOMEM,
                         "Unable to allocate memory for uncompressed data");
       return (ARCHIVE_FATAL);
     }
     rar->lzss.window = (unsigned char *)new_window;
-    rar->dictionary_size = new_size;
     memset(rar->lzss.window, 0, rar->dictionary_size);
     rar->lzss.mask = rar->dictionary_size - 1;
   }
@@ -2843,29 +2851,26 @@ parse_codes20(struct archive_read *a)
   memcpy(rar->oldtable20, table, tablesize);
   rar->tables_read20 = 1;
 
+  {
+    unsigned int file_dictionary_size;
+
+    file_dictionary_size = rar_lzss_dictionary_size(rar->file_flags);
+    if (file_dictionary_size > rar->dictionary_size)
+      rar->dictionary_size = file_dictionary_size;
+  }
+
   if (!rar->dictionary_size || !rar->lzss.window ||
       (unsigned int)(rar->lzss.mask + 1) < rar->dictionary_size)
   {
     void *new_window;
-    unsigned int new_size;
 
-    if (rar->unp_size >= DICTIONARY_MAX_SIZE)
-      new_size = DICTIONARY_MAX_SIZE;
-    else
-      new_size = rar_fls((unsigned int)rar->unp_size) << 1;
-    if (new_size == 0) {
-      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-                        "Zero window size is invalid");
-      return (ARCHIVE_FAILED);
-    }
-    new_window = realloc(rar->lzss.window, new_size);
+    new_window = realloc(rar->lzss.window, rar->dictionary_size);
     if (new_window == NULL) {
       archive_set_error(&a->archive, ENOMEM,
                         "Unable to allocate memory for uncompressed data");
       return (ARCHIVE_FATAL);
     }
     rar->lzss.window = (unsigned char *)new_window;
-    rar->dictionary_size = new_size;
     memset(rar->lzss.window, 0, rar->dictionary_size);
     rar->lzss.mask = rar->dictionary_size - 1;
   }
@@ -4029,6 +4034,25 @@ clear_filters(struct rar_filters *filters)
   delete_filter(filters->stack);
   delete_program_code(filters->progs);
   free(filters->vm);
+  memset(filters, 0, sizeof(*filters));
+}
+
+static void
+reset_file_filters(struct rar_filters *filters, int solid)
+{
+  if (!solid) {
+    clear_filters(filters);
+    return;
+  }
+
+  delete_filter(filters->stack);
+  filters->stack = NULL;
+  free(filters->vm);
+  filters->vm = NULL;
+  filters->filterstart = INT64_MAX;
+  filters->lastend = 0;
+  filters->bytes = NULL;
+  filters->bytes_ready = 0;
 }
 
 static void
