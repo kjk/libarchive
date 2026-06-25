@@ -1154,7 +1154,7 @@ archive_read_format_rar_read_data(struct archive_read *a, const void **buff,
   case COMPRESS_METHOD_GOOD:
   case COMPRESS_METHOD_BEST:
     ret = read_data_compressed(a, buff, size, offset, 0);
-    if (ret != ARCHIVE_OK && ret != ARCHIVE_WARN) {
+    if (ret != ARCHIVE_EOF && ret != ARCHIVE_OK && ret != ARCHIVE_WARN) {
       __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
       rar->start_new_table = 1;
       rar->ppmd_valid = 0;
@@ -1839,7 +1839,7 @@ read_header(struct archive_read *a, struct archive_entry *entry,
     memset(rar->lengthtable, 0, sizeof(rar->lengthtable));
     memset(rar->oldtable20, 0, sizeof(rar->oldtable20));
     __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
-    rar->ppmd_valid = rar->ppmd_eod = 0;
+    rar->ppmd_valid = 0;
   }
   rar->offset_seek = 0;
   rar->entry_start_offset = rar->offset;
@@ -1850,6 +1850,7 @@ read_header(struct archive_read *a, struct archive_entry *entry,
   rar->crc_calculated = 0;
   rar->entry_eof = 0;
   rar->valid = 1;
+  rar->ppmd_eod = 0;
   free(rar->unp_buffer);
   rar->unp_buffer = NULL;
   rar->unp_offset = 0;
@@ -2125,6 +2126,10 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
        (rar->dictionary_size &&
         rar->offset - rar->entry_start_offset >= rar->unp_size))
     {
+      if (!rar->ppmd_eod && rar->is_ppmd_block) {
+        rar->is_ppmd_block = 0;
+        rar->start_new_table = 1;
+      }
       if (rar->unp_offset > 0) {
         /*
          * We have unprocessed extracted data. write it out.
@@ -2228,6 +2233,8 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
 
           case 2:
             rar->ppmd_eod = 1;/* End Of ppmd Data. */
+            rar->is_ppmd_block = 0;
+            rar->start_new_table = 1;
             continue;
 
           case 3:
@@ -2308,6 +2315,8 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
 
       rar->bytes_uncopied = end - start;
       rar->filters.lastend = end;
+      if (rar->is_ppmd_block && rar->bytes_uncopied == 0)
+        continue;
       if (rar->filters.lastend != rar->filters.filterstart && rar->bytes_uncopied == 0) {
           /* Broken RAR files cause this case.
           * NOTE: If this case were possible on a normal RAR file
@@ -3417,7 +3426,6 @@ expand(struct archive_read *a, int64_t *end)
 
     if ((symbol = read_next_symbol(a, &rar->maincode)) < 0)
       goto bad_data;
-
     if (symbol < 256)
     {
       lzss_emit_literal(rar, (uint8_t)symbol);
