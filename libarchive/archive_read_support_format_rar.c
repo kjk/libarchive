@@ -345,6 +345,7 @@ struct rar
   int64_t offset;
   int64_t offset_outgoing;
   int64_t offset_seek;
+  int64_t solid_offset;
   char valid;
   unsigned int unp_offset;
   unsigned int unp_buffer_size;
@@ -1817,16 +1818,21 @@ read_header(struct archive_read *a, struct archive_entry *entry,
     return (ARCHIVE_FATAL);
   }
 
-  rar->bytes_uncopied = rar->bytes_unconsumed = 0;
+  rar->bytes_unconsumed = 0;
   if (rar->file_flags & FHD_SOLID) {
     if (rar->lzss.window == NULL) {
       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
                         "Solid RAR entry without initialized dictionary");
       return (ARCHIVE_FATAL);
     }
-    rar->offset = rar->lzss.position;
+    rar->offset = rar->solid_offset;
+    if (rar->offset == 0)
+      rar->offset = rar->lzss.position;
+    rar->bytes_uncopied = rar->lzss.position - rar->offset;
   } else {
     rar->lzss.position = rar->offset = 0;
+    rar->bytes_uncopied = 0;
+    rar->solid_offset = 0;
     rar->dictionary_size = 0;
     rar->is_ppmd_block = 0;
     rar->start_new_table = 1;
@@ -2124,12 +2130,11 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
 
     if (rar->ppmd_eod ||
        (rar->dictionary_size &&
-        rar->offset - rar->entry_start_offset >= rar->unp_size))
+        rar->offset - rar->entry_start_offset >= rar->unp_size &&
+        (!rar->is_ppmd_block ||
+         lzss_position(&rar->lzss) > rar->entry_start_offset + rar->unp_size)))
     {
-      if (!rar->ppmd_eod && rar->is_ppmd_block) {
-        rar->is_ppmd_block = 0;
-        rar->start_new_table = 1;
-      }
+      rar->solid_offset = rar->entry_start_offset + rar->unp_size;
       if (rar->unp_offset > 0) {
         /*
          * We have unprocessed extracted data. write it out.
@@ -2160,10 +2165,20 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
 
     if (!rar->is_ppmd_block && rar->dictionary_size && rar->bytes_uncopied > 0)
     {
-      if (rar->bytes_uncopied > (rar->unp_buffer_size - rar->unp_offset))
+      int64_t entry_bytes_remaining;
+
+      entry_bytes_remaining = rar->entry_start_offset + rar->unp_size -
+          rar->offset;
+      if (entry_bytes_remaining < 0)
+        entry_bytes_remaining = 0;
+      if (rar->bytes_uncopied > entry_bytes_remaining)
+        bs = (size_t)entry_bytes_remaining;
+      else if (rar->bytes_uncopied > (rar->unp_buffer_size - rar->unp_offset))
         bs = rar->unp_buffer_size - rar->unp_offset;
       else
         bs = (size_t)rar->bytes_uncopied;
+      if (bs == 0)
+        continue;
       ret = copy_from_lzss_window_to_unp(a, buff, rar->offset, bs);
       if (ret != ARCHIVE_OK)
         return (ret);
@@ -2327,10 +2342,22 @@ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
           return (ARCHIVE_FAILED);
       }
     }
-    if (rar->bytes_uncopied > (rar->unp_buffer_size - rar->unp_offset))
-      bs = rar->unp_buffer_size - rar->unp_offset;
-    else
-      bs = (size_t)rar->bytes_uncopied;
+    {
+      int64_t entry_bytes_remaining;
+
+      entry_bytes_remaining = rar->entry_start_offset + rar->unp_size -
+          rar->offset;
+      if (entry_bytes_remaining < 0)
+        entry_bytes_remaining = 0;
+      if (rar->bytes_uncopied > entry_bytes_remaining)
+        bs = (size_t)entry_bytes_remaining;
+      else if (rar->bytes_uncopied > (rar->unp_buffer_size - rar->unp_offset))
+        bs = rar->unp_buffer_size - rar->unp_offset;
+      else
+        bs = (size_t)rar->bytes_uncopied;
+    }
+    if (bs == 0)
+      continue;
     ret = copy_from_lzss_window_to_unp(a, buff, rar->offset, bs);
     if (ret != ARCHIVE_OK)
       return (ret);
