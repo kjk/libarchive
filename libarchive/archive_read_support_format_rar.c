@@ -1929,6 +1929,12 @@ read_exttime(const char *p, struct rar *rar, const char *endp)
   struct tm tmbuf;
 #endif
 
+  /*
+   * Some RAR3 writers set FHD_EXTTIME without appending the optional
+   * extended time payload. UnRAR treats this as absent.
+   */
+  if (p == endp)
+    return (0);
   if (p + 2 > endp)
     return (-1);
   flags = archive_le16dec(p);
